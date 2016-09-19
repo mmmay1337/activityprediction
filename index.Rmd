@@ -1,0 +1,203 @@
+---
+title: "Predicting with Accelerometer Data"
+author: "May Phang"
+date: "September 19, 2016"
+output: html_document
+---
+
+# Executive summary
+With the advancement of technology, it has now become easier and cheaper to collect physical activity data through fitness wristbands. Typically, how well an individual performs an activity such as a barbell curl can be graded according to a set of specifications, e.g. performing a barbell curl by throwing the elbows to the front is awarded a B grade.
+
+This paper demonstrates how we can build models using accelerometer data to predict how well a bicep curl was performed. More specifically, this paper explores building a GBM (Gradient Boosting Machine) model in predicting an activity's grade.
+
+The accelerometer data used as part of this exercise comes from the Groupware team; for more information please visit <http://groupware.les.inf.puc-rio.br/har> (weight lifting exercise section).
+
+# Exploratory data analysis
+
+Before building the model, the data needs to be understood well - this will help with deciding which variables are to be kept, and make note of any intricacies of the data. After loading the data, we first inspect the data and look at what is available.
+
+```{r setup, cache=TRUE}
+# clear the R environment
+rm(list=ls())
+# download training and test dataset if not already in the directory
+if(!file.exists("pml-training.csv")) {
+  download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", destfile="pml-training.csv")
+  }
+if(!file.exists("pml-testing.csv")) {
+  download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", destfile="pml-testing.csv")
+}
+# read datasets into R
+train <- read.csv("pml-training.csv", stringsAsFactors = FALSE)
+test <- read.csv("pml-testing.csv", stringsAsFactors = FALSE) # note that this will be missing the classe var
+# convert the classe variables to a factor variable
+train$classe <- as.factor(train$classe)
+
+# inspect data to understand data structure
+# head(train)
+# summary(train)
+```
+
+Note that each row contains a grading (this is the "classe" variable), along with other accelerometer data e.g. fore arm acceleration.
+
+## Gradings distribution
+
+The model's target prediction (response) will be the exercise grade ("classe" in the dataset) - this ranges between letters A - E. To ensure that observations aren't biased towards a certain grade, we plot the distributions of grades.
+
+```{r varhist, warning=FALSE, echo=FALSE, fig.align="center"}
+library(ggplot2)
+# plot distribution of the classe variables
+qplot(classe, stat="count", xlab = "grade", main = "Observations by Activity Grade", data = train)
+```
+
+This suggests that the observations are more or less distributed evenly across each grade, with at least 3,000 observations per rating - this shouldn't be an issue on sparsity.
+
+## Variables to be excluded
+The models should be built on meaningful predictors (data columns), as opposed to making use of as many predictors as possible. Following manual inspection of the data, the following columns have been removed: 
+
+* **Aggregated measures**: these include statistics such as averages, kurtosis and so on. These are based on a certain window (time) period, so is missing during each time window.
+* **Subject identifiers**: the grading of an activity should be independent of individuals, hence we would want to avoid the model predicting certain individuals as being more likely to score certain grades.
+
+```{r removvar, warning=FALSE, cache=TRUE, message=FALSE}
+# remove the following variables that identify the individual
+rm.vars <- c("X", "user_name", "raw_timestamp_part_1", "raw_timestamp_part_2", "cvtd_timestamp", "new_window", "num_window")
+rm.vars <- match(rm.vars, names(train))
+# remove aggregating predictors
+rm.names <- grep("^(kurtosis|skewness|min|max|avg|amplitude|stddev|var)", names(train), value = TRUE)
+rm.names <- match(rm.names, names(train))
+train <- train[, -c(rm.vars, rm.names)]
+```
+
+## Pre-processing data
+After checking that the remaining 52 predictors do not have missing values, we inspect the distribution of each predictor to ensure it is not too wide-ranging. If one predictor is wide-ranging, this can sometimes make the training process slow. Thus, we plot boxplots of each of the variables using the following code:
+
+```{r plotvars, warning=FALSE, cache=TRUE, message=FALSE, fig.align="center"}
+library(reshape2)
+library(ggplot2)
+varsumm <- melt(train, id = "classe") # summarise the data into a tall skinny dataset
+
+p <- ggplot(varsumm, aes(x = variable, y=value))
+p + geom_boxplot(aes(fill = variable)) + theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  theme(legend.position = "none")
+```
+
+While most of the variables are centred around 0, this does not appear to be case across all variables. Hence prior to the training the model onto the dataset, we will need to centre and scale the remaining variables. The centering and scaling can be done with the following code:
+
+```{r centrescale, warning=FALSE, cache=TRUE}
+library(caret)
+preproc <- preProcess(train[, -ncol(train)], method=c("center", "scale")) # creates a pre-processing object that centres and scales
+train <- predict(preproc, train) # applies the identified centering and scaling back onto the original training dataset
+```
+
+# Model Development
+
+This section details the steps involved in building the predictive model.
+
+## Cross Validation and Data Splitting
+
+It is standard practice that the data for model development is partitioned into a training (data used to train the model) and validation portion (used for assessing the model's performance). This split is typically a 60/40 or 80/20, depending on the amount of data.
+
+Recognising that data is somewhat 'finite': 
+
+* training on as much data helps reduce model bias (ensures that the models aren't overly simplistic and obtains a more accurate set of parameters)
+* the lack of existence of an 'endless' supply of validation data, leading to potentials to overfit to the training set (high variance) i.e. the model only works really well on the training set, but not on new datasets
+
+Cross-Validation can help manage the above to an extent. This is achieved by first evenly splitting the data into k chunks (observations selected into each partition are random), then iteratively training on the k-1 chunks and assessing the model performance on the k^th^ chunk (at each chunk). This helps with giving the test error, or the Out Of Bag (OOB) sample error.
+
+For this exercise, while using Cross-Validation may not necessarily imply the data needs to be split into training and validation/test (as Cross-Validation will in some ways already give an estimate of the OOB error), the data is still split prior to training as a precautionary measure. The following code shows the necessary steps for data splitting using the Caret package.
+
+```{r preproc, warning=FALSE, cache=TRUE}
+library(caret)
+set.seed(1000) # always best to specify the seed for reproducibility, required in the random splitting process
+inTrain = createDataPartition(train$classe, p = 0.75)[[1]] 
+tr = train[inTrain,] # partition to train the data on
+tr_te = train[-inTrain,] # validation portion
+```
+
+## Model Training
+
+While other predictive models could be used, this report explores building a GBM for the following reasons: 
+
+* GBM's have been known to be quite accurate and have won many past Kaggle competitions (XGBoost package)
+* explore GBM parameter tuning
+
+GBM's and Random Forests are known to take a while to train, so parallel processing will be used to increase training speed (credits to Leonard Greski, one of the course mentors).
+
+```{r GBMModel, warning=FALSE, cache=TRUE, message=FALSE}
+library(parallel)
+library(doParallel)
+set.seed(1000)
+
+# regiter the clusers
+cluster <- makeCluster(detectCores()-1) # identifies available cores on current machine; leave 1 core free
+registerDoParallel(cluster)
+
+# Specify Cross Validation folds and allow for parallel processing
+fitControl <- trainControl(method = "cv", # use of crossvalidations
+                           number = 5,   # 5 folds
+                           allowParallel = TRUE)
+
+# Paramater tuning for GBM - over-ride default parameters
+gbmGrid <- expand.grid(interaction.depth = 10, # allows for how "deep" the interactions can go up to
+                       n.trees = 150, # specifies the number of trees to build
+                       shrinkage = 0.1, # specify learning rate (larger will converge quicker but loses accuracy)
+                       n.minobsinnode = 20) # specifies min number of obs in each node prior to splitting
+
+# start training the model - this step takes the most time
+fitGBM <- train(x=tr[, -ncol(tr)], y=tr$classe, method="gbm", trControl = fitControl, tuneGrid = gbmGrid,
+                verbose = FALSE)
+
+stopCluster(cluster) # disconnects the cluster
+
+```
+
+*Note that there is no 'perfect' set of parameters - this is very much a science. The above parameters have been selected through trial and error, with a bit of an allowance for over-fitting given Cross-Validation (and also gradings in this sense are based on a specific set of specifications). We allow for the overfitting via the interaction depth and number of trees.
+
+## Predictors Used in Model
+
+The GBM can provide some information on how many predictors had some degree of influence on the response variables, and also list the top influential predictors.
+
+```{r finalmodel, message=FALSE, cache=TRUE}
+# check how many predictors were used
+fitGBM$finalModel
+# list and plot top influential predictors
+head(summary(fitGBM), 10)
+```
+
+It appears most of the remaining predictors were used (52 were statistically significant), with the top influential predictor being "roll_belt".
+
+# Model Assessment
+
+this section looks at the model performance through the estimated test errors. We make use of Confusion Matrices to assess diagnostics such as prediction accuracy. ***Note that due to Cross-Validation being used as part of training, the OOB error can be estimated as 1 - accuracy, where the accuracy should have been calculated as the weighted average accuracy on each Cross Validation chunk***. 
+
+## Overall Estimated OOB Errors
+
+```{r ooberror, cache=TRUE, warning=FALSE, message=FALSE}
+confusionMatrix(tr$classe, predict(fitGBM, newdata=tr[, -53])) # observe training accuracy by grades
+print(fitGBM) # obtain overall metrics
+```
+
+The overall **estimated OOB error is `r round(100 - 100*fitGBM$results$Accuracy, 2)`%** ( 1 - accuracy), while training error is `r 100 - 99.99`% (although the Confusion Matrix appears to show perfect classification).
+
+## Accuracy on Validation Set
+
+```{r valerror, cache=TRUE, warning=FALSE, message=FALSE}
+pGBM <- predict(fitGBM, newdata=tr_te[, -53])
+confusionMatrix(tr_te$classe, pGBM)
+```
+
+The error on the validation set is 0.82%, which is reasonably close to the estimated OOB error calculated from the training set.
+
+# Model Predictions
+
+Now that the models have been finalised, this can be used to predict grades on new data. We will need to firstly apply the pre-processing completed above onto the new dataset, then apply the model onto it. Note that the test dataset provided from the course only contains the accelerometer data, so will be unable to specify the actual accuracy in this paper.
+
+```{r predict, cache=TRUE}
+test <- predict(preproc, test[, -c(rm.vars, rm.names)]) # apply pre-processing onto test set
+test_pred <- predict(fitGBM, newdata=test)
+# 20 test preds:
+test_pred
+```
+
+# Further remarks
+
+The model fitting process can be at times subjective - this boils down to the bias-variance trade off (how much do we allow for overfitting and generalization). No one model will necessarily outperform the other, this can be very much subject to parameter tuning - some have used 'ensemble' models, which involves combining more than 1 predictive models. It is much more important to ensure the data being used is in the right format, and that all necessary data cleaning/pre-processing has bene carried out.
